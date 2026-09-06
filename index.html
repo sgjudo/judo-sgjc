@@ -270,6 +270,10 @@ select.hsel{padding:7px 12px;border-radius:7px;border:2px solid var(--border);ba
       • <strong style="color:var(--green)">Valider &amp; Envoyer</strong> — enregistre l'appel localement <em>et</em> l'envoie dans Firebase en temps réel
     </p>
 
+    <div id="auth-box" style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin-bottom:14px;padding:10px 12px;background:rgba(0,0,0,.2);border-radius:6px;">
+      <span style="font-size:12px;color:var(--muted)">⏳ Vérification de la connexion…</span>
+    </div>
+
     <div style="margin-bottom:12px;">
       <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px;">Saison</label>
       <input type="text" id="sync-saison" class="fld" placeholder="2025-2026" style="width:120px" oninput="saveSaison()">
@@ -829,7 +833,10 @@ const FIREBASE_CONFIG = {
 
 let _fbApp = null;
 let _fbDb  = null;
+let _fbAuth = null;
+let _fbUser = null;
 let _fbInitialized = false;
+let _fbAuthListenerSet = false;
 
 function getSyncSaison() {
   return (document.getElementById('sync-saison')||{}).value ||
@@ -845,14 +852,20 @@ function saveSaison() {
 }
 
 async function loadFirebaseSDK() {
-  if (window.firebase && window.firebase.firestore) return true;
+  if (window.firebase && window.firebase.firestore && window.firebase.auth) return true;
   return new Promise((resolve) => {
     const s1 = document.createElement('script');
     s1.src = 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js';
     s1.onload = () => {
       const s2 = document.createElement('script');
       s2.src = 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js';
-      s2.onload = () => resolve(true);
+      s2.onload = () => {
+        const s3 = document.createElement('script');
+        s3.src = 'https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js';
+        s3.onload = () => resolve(true);
+        s3.onerror = () => resolve(false);
+        document.head.appendChild(s3);
+      };
       s2.onerror = () => resolve(false);
       document.head.appendChild(s2);
     };
@@ -873,9 +886,16 @@ async function fbInit(silent = false) {
       _fbApp = firebase.app();
     }
     _fbDb = firebase.firestore();
-    await _fbDb.collection('eleves').doc('ping_test').get();
+    _fbAuth = firebase.auth();
+    if (!_fbAuthListenerSet) {
+      _fbAuth.onAuthStateChanged(updateAuthUI);
+      _fbAuthListenerSet = true;
+    }
     _fbInitialized = true;
-    if (!silent) setSyncStatus('✅ Connecté à Firebase', 'var(--green)');
+    if (!silent) {
+      setSyncStatus(_fbAuth.currentUser ? '✅ Connecté à Firebase' : '🔒 Connectez-vous avec Google pour synchroniser',
+                    _fbAuth.currentUser ? 'var(--green)' : 'var(--amber)');
+    }
     return true;
   } catch(e) {
     setSyncStatus(`❌ Erreur Firebase : ${e.message}`, 'var(--red)');
@@ -883,11 +903,52 @@ async function fbInit(silent = false) {
   }
 }
 
-async function fbPullEleves() {
+// ── Authentification Google (obligatoire — RGPD : accès restreint aux comptes autorisés) ──
+async function fbEnsureAuth() {
   if (!_fbInitialized) {
-    const ok = await fbInit();
-    if (!ok) return;
+    const ok = await fbInit(true);
+    if (!ok) return false;
   }
+  if (_fbAuth && _fbAuth.currentUser) return true;
+  return await fbSignIn();
+}
+
+async function fbSignIn() {
+  try {
+    setSyncStatus('⏳ Connexion avec votre compte Google…', 'var(--accent)');
+    const provider = new firebase.auth.GoogleAuthProvider();
+    const result = await _fbAuth.signInWithPopup(provider);
+    updateAuthUI(result.user);
+    setSyncStatus('✅ Connecté en tant que ' + (result.user.email || result.user.displayName), 'var(--green)');
+    return true;
+  } catch(e) {
+    setSyncStatus('❌ Connexion Google refusée : ' + e.message, 'var(--red)');
+    toast('Connexion Google annulée ou refusée', 'err');
+    return false;
+  }
+}
+
+function fbSignOut() {
+  if (_fbAuth) _fbAuth.signOut();
+  setSyncStatus('🔒 Déconnecté — connectez-vous pour synchroniser', 'var(--amber)');
+}
+
+function updateAuthUI(user) {
+  _fbUser = user;
+  const box = document.getElementById('auth-box');
+  if (!box) return;
+  if (user) {
+    box.innerHTML = `<span style="font-size:12px;color:var(--green)">🔓 Connecté : <strong>${user.email || user.displayName || 'compte Google'}</strong></span>
+      <button class="qbtn" style="margin-left:auto" onclick="fbSignOut()">Se déconnecter</button>`;
+  } else {
+    box.innerHTML = `<span style="font-size:12px;color:var(--amber)">🔒 Non connecté — la synchronisation nécessite un compte Google autorisé</span>
+      <button class="qbtn primary" style="margin-left:auto" onclick="fbSignIn()">🔑 Se connecter avec Google</button>`;
+  }
+}
+
+async function fbPullEleves() {
+  const ok = await fbEnsureAuth();
+  if (!ok) return;
   const saison = getSyncSaison();
   setSyncStatus('⏳ Récupération des élèves depuis Firebase…', 'var(--accent)');
   try {
@@ -945,10 +1006,8 @@ async function fbPullEleves() {
 
 async function fbPushPresences() {
   if (!records.length) { toast('Aucune présence à envoyer','err'); return; }
-  if (!_fbInitialized) {
-    const ok = await fbInit(true);
-    if (!ok) { toast('Firebase non configuré — configurez-le dans Paramètres','err'); return; }
-  }
+  const ok = await fbEnsureAuth();
+  if (!ok) { toast('Connexion Google requise pour synchroniser','err'); return; }
   const saison = getSyncSaison();
   setSyncStatus('⏳ Envoi des présences dans Firebase…', 'var(--accent)');
   try {
